@@ -1,0 +1,12 @@
+# Core — required for all space modes
+numpy>=1.24
+pandas>=1.5
+matplotlib>=3.6
+
+# Geometric mode (--space geometric)
+pyproj>=3.4
+
+# Network mode (--space network)
+osmnx>=1.6
+networkx>=3.0
+shapely>=2.0
