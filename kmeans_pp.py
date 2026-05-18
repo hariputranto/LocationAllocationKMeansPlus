@@ -1,95 +1,290 @@
-"""Constrained K-Means with K-Means++ seeding for new supply locations.
+"""Constrained K-Means++ for new supply location-allocation.
+
+Space modes
+-----------
+euclidean  Straight-line distance in the input x/y coordinate space.
+geometric  Input must be lon/lat; coordinates are projected to the local UTM
+           zone and straight-line distances are in metres.
+network    Input must be lon/lat; a street network is downloaded from
+           OpenStreetMap (via OSMnx), every point is edge-snapped to the
+           nearest street segment, and distances are shortest-path travel
+           lengths in metres.  New supply locations are placed on the network
+           at the snapped edge position of the optimal demand medoid.
+
+Edge snapping (network mode)
+----------------------------
+Each point is orthogonally projected onto its nearest OSM edge (the
+perpendicular foot-point).  The snapped position retains full network
+connectivity: distances to both edge endpoints are stored and used when
+computing shortest-path distances through the graph.
 
 Problem
 -------
-You have demand points and existing supply points (frozen cluster centers).
+You have demand points and existing supply points (frozen cluster centres).
 You want to add N new supply points so that demand is served as efficiently
-as possible, without moving the existing centers.
+as possible, without moving the existing centres.
 
 Algorithm
 ---------
-1. K-Means++ seeding for the N new centers: D(x) is the distance from a demand
-   point to the nearest already-placed center (existing supply OR a new center
-   chosen earlier in seeding). Sampling probability is proportional to
-   weight(x) * D(x)^2.
-2. Constrained Lloyd's iteration: assign each demand to its nearest center
-   (existing or new), then update ONLY the new centers as the weighted mean
-   of demands assigned to them. Existing centers never move.
+1. K-Means++ seeding for the N new centres (D(x) is the distance from a
+   demand point to the nearest already-placed centre; sampling probability
+   ∝ weight(x) · D(x)²).
+2. Constrained Lloyd's iteration: assign each demand to its nearest centre,
+   then update ONLY the new centres (weighted mean for Euclidean/geometric,
+   weighted medoid for network).  Existing centres never move.
 
-Inputs (CSV)
+Dependencies
 ------------
---demand demand.csv  : must contain columns 'x', 'y'. Optional 'weight' column
-                       (defaults to 1). All other columns are preserved in the
-                       output CSV.
---supply supply.csv  : must contain columns 'x', 'y'.
+All modes   numpy  pandas  matplotlib
+geometric   pyproj
+network     osmnx  networkx  shapely  pyproj
 
-Outputs
--------
-- A figure with two panels: cluster assignment before vs. after adding new
-  supply, with existing and new centers marked.
-- A CSV: the original demand rows plus 'cluster_before', 'cluster_after',
-  and 'is_new_cluster' columns.
+Usage
+-----
+python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 3
+python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 3 --space geometric
+python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 3 --space network
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+SpaceType = Literal["euclidean", "geometric", "network"]
 
-# ---------- Core algorithm -------------------------------------------------
+# ── optional heavy dependencies ───────────────────────────────────────────────
+
+try:
+    import networkx as nx
+    import osmnx as ox
+    from shapely.geometry import LineString, Point
+    _HAS_NET = True
+    _OSMNX_MAJOR = int(ox.__version__.split(".")[0])
+except ImportError:
+    _HAS_NET = False
+    _OSMNX_MAJOR = 0
+
+try:
+    from pyproj import Transformer as _Transformer
+    _HAS_PROJ = True
+except ImportError:
+    _HAS_PROJ = False
 
 
-def _nearest_sq_dist(X: np.ndarray, centers: np.ndarray) -> np.ndarray:
-    """For each row of X, squared distance to the nearest row of centers."""
-    # (n, k) matrix of squared distances, then min over k.
+# ── edge-snap data class ──────────────────────────────────────────────────────
+
+@dataclass
+class EdgeSnap:
+    """One input point after snapping to the nearest OSM edge (projected graph)."""
+    proj_x: float    # projected (UTM) x of the foot-point [m]
+    proj_y: float    # projected (UTM) y of the foot-point [m]
+    snap_lon: float  # back-projected longitude of the foot-point
+    snap_lat: float  # back-projected latitude  of the foot-point
+    u: int           # from-node osmid of the host edge
+    v: int           # to-node  osmid of the host edge
+    key: int         # multigraph edge key (usually 0)
+    dist_u: float    # distance from foot-point to node u along the edge [m]
+    dist_v: float    # distance from foot-point to node v along the edge [m]
+
+
+# ── projection helpers ────────────────────────────────────────────────────────
+
+def _make_utm_projectors(all_lons: np.ndarray, all_lats: np.ndarray):
+    """Return (forward, inverse) pyproj Transformers for the local UTM zone."""
+    if not _HAS_PROJ:
+        raise ImportError(
+            "pyproj is required for geometric and network space.\n"
+            "  pip install pyproj"
+        )
+    clon = float(np.mean(all_lons))
+    clat = float(np.mean(all_lats))
+    zone = int((clon + 180) / 6) + 1
+    hemi = "north" if clat >= 0 else "south"
+    utm  = f"+proj=utm +zone={zone} +{hemi} +ellps=WGS84"
+    fwd  = _Transformer.from_crs("EPSG:4326", utm, always_xy=True)
+    inv  = _Transformer.from_crs(utm, "EPSG:4326", always_xy=True)
+    return fwd, inv
+
+
+# ── OSMnx / network helpers ───────────────────────────────────────────────────
+
+def _fetch_graph(
+    lons: np.ndarray,
+    lats: np.ndarray,
+    network_type: str = "drive",
+    buffer_m: float = 500,
+):
+    """Download and project the OSM street network covering all given points.
+
+    Returns (G, G_proj) where G is in WGS-84 (lon/lat) and G_proj is in the
+    graph's local projected CRS (metres).
+    """
+    if not _HAS_NET:
+        raise ImportError(
+            "osmnx, networkx and shapely are required for network space.\n"
+            "  pip install osmnx networkx shapely"
+        )
+    margin = max(1e-4, buffer_m / 111_000)   # degrees ≈ buffer_m metres
+    north  = float(lats.max()) + margin
+    south  = float(lats.min()) - margin
+    east   = float(lons.max()) + margin
+    west   = float(lons.min()) - margin
+
+    print(
+        f"Fetching OSM network  ({south:.4f}–{north:.4f} N, "
+        f"{west:.4f}–{east:.4f} E)  type={network_type} …"
+    )
+    if _OSMNX_MAJOR >= 2:
+        from shapely.geometry import box as _box
+        G = ox.graph_from_polygon(_box(west, south, east, north),
+                                   network_type=network_type)
+    else:
+        G = ox.graph_from_bbox(north, south, east, west,
+                               network_type=network_type,
+                               buffer_dist=buffer_m)
+
+    print(f"  {G.number_of_nodes()} nodes, {G.number_of_edges()} edges — projecting …")
+    G_proj = ox.project_graph(G)
+    return G, G_proj
+
+
+def _snap_to_edges(
+    G_proj,
+    proj_xs: np.ndarray,
+    proj_ys: np.ndarray,
+    back_proj,
+) -> list[EdgeSnap]:
+    """Snap each projected point to its nearest edge in G_proj.
+
+    back_proj is a pyproj Transformer (projected CRS → EPSG:4326).
+    """
+    xs = np.atleast_1d(proj_xs).astype(float)
+    ys = np.atleast_1d(proj_ys).astype(float)
+
+    if _OSMNX_MAJOR >= 2:
+        nearest = ox.nearest_edges(G_proj, xs, ys)
+    else:
+        nearest = ox.nearest_edges(G_proj, xs, ys, return_dist=False)
+
+    snaps: list[EdgeSnap] = []
+    for i, (u, v, key) in enumerate(nearest):
+        ed = G_proj[u][v][key]
+        if "geometry" in ed:
+            line: LineString = ed["geometry"]
+        else:
+            ux, uy = G_proj.nodes[u]["x"], G_proj.nodes[u]["y"]
+            vx, vy = G_proj.nodes[v]["x"], G_proj.nodes[v]["y"]
+            line = LineString([(ux, uy), (vx, vy)])
+
+        pt     = Point(xs[i], ys[i])
+        d_u    = line.project(pt)          # distance along edge from u end
+        foot   = line.interpolate(d_u)
+        sx, sy = foot.x, foot.y
+
+        if back_proj is not None:
+            slon, slat = back_proj.transform(sx, sy)
+        else:
+            slon, slat = sx, sy
+
+        snaps.append(EdgeSnap(
+            proj_x=float(sx),  proj_y=float(sy),
+            snap_lon=float(slon), snap_lat=float(slat),
+            u=int(u), v=int(v), key=int(key),
+            dist_u=float(d_u),
+            dist_v=float(max(line.length - d_u, 0.0)),
+        ))
+    return snaps
+
+
+def _precompute_node_dists(
+    G_proj,
+    snaps: list[EdgeSnap],
+) -> dict[int, dict[int, float]]:
+    """Dijkstra from every unique node that is an endpoint of a snapped edge."""
+    nodes = {s.u for s in snaps} | {s.v for s in snaps}
+    print(f"  Running Dijkstra from {len(nodes)} nodes (this may take a moment) …")
+    return {
+        n: dict(nx.single_source_dijkstra_path_length(G_proj, n, weight="length"))
+        for n in nodes
+    }
+
+
+def _snap_dist(
+    a: EdgeSnap,
+    b: EdgeSnap,
+    nd: dict[int, dict[int, float]],
+) -> float:
+    """Shortest network distance between two edge-snapped points [m]."""
+    cands: list[float] = []
+
+    # Same-edge shortcut: travel directly along the shared edge
+    if a.u == b.u and a.v == b.v and a.key == b.key:
+        cands.append(abs(a.dist_u - b.dist_u))
+
+    # Routes via pairs of (a-endpoint, b-endpoint)
+    for da, ua in [(a.dist_u, a.u), (a.dist_v, a.v)]:
+        for db, ub in [(b.dist_u, b.u), (b.dist_v, b.v)]:
+            via = nd.get(ua, {}).get(ub, np.inf)
+            cands.append(da + via + db)
+
+    return float(min(cands))
+
+
+def _build_dist_matrix(
+    snaps: list[EdgeSnap],
+    nd: dict[int, dict[int, float]],
+) -> np.ndarray:
+    n = len(snaps)
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _snap_dist(snaps[i], snaps[j], nd)
+            D[i, j] = d
+            D[j, i] = d
+    return D
+
+
+# ── Euclidean core (euclidean / geometric modes) ──────────────────────────────
+
+def _eu_nearest_sq(X: np.ndarray, centers: np.ndarray) -> np.ndarray:
     diff = X[:, None, :] - centers[None, :, :]
     return np.min(np.sum(diff ** 2, axis=2), axis=1)
 
 
-def kmeans_pp_init_with_fixed(
+def _eu_assign(X: np.ndarray, centers: np.ndarray):
+    diff = X[:, None, :] - centers[None, :, :]
+    sq   = np.sum(diff ** 2, axis=2)
+    lbl  = np.argmin(sq, axis=1)
+    return lbl, sq[np.arange(len(X)), lbl]
+
+
+def _eu_kpp_init(
     X: np.ndarray,
     weights: np.ndarray,
     fixed_centers: np.ndarray,
     n_new: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Pick n_new centers from X via K-Means++, treating fixed_centers as already-chosen."""
-    n_samples, n_features = X.shape
-    new_centers = np.empty((n_new, n_features), dtype=X.dtype)
-
-    sq_dist = _nearest_sq_dist(X, fixed_centers)
-
+    n, k = X.shape
+    nc   = np.empty((n_new, k))
+    sq   = _eu_nearest_sq(X, fixed_centers)
     for i in range(n_new):
-        scores = weights * sq_dist
-        total = scores.sum()
-        if total <= 0:
-            # Every demand coincides with a center — pick uniformly at random.
-            idx = rng.integers(n_samples)
-        else:
-            idx = rng.choice(n_samples, p=scores / total)
-        new_centers[i] = X[idx]
-
-        # Update D(x)^2 to include the newly chosen center.
-        new_sq = np.sum((X - new_centers[i]) ** 2, axis=1)
-        sq_dist = np.minimum(sq_dist, new_sq)
-
-    return new_centers
+        scores = weights * sq
+        tot    = scores.sum()
+        idx    = int(rng.integers(n) if tot <= 0 else rng.choice(n, p=scores / tot))
+        nc[i]  = X[idx]
+        sq     = np.minimum(sq, np.sum((X - nc[i]) ** 2, axis=1))
+    return nc
 
 
-def assign(X: np.ndarray, centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (labels, squared-distance-to-assigned-center) for each row of X."""
-    diff = X[:, None, :] - centers[None, :, :]
-    sq = np.sum(diff ** 2, axis=2)
-    labels = np.argmin(sq, axis=1)
-    return labels, sq[np.arange(len(X)), labels]
-
-
-def constrained_kmeans(
+def constrained_kmeans_euclidean(
     X: np.ndarray,
     weights: np.ndarray,
     fixed_centers: np.ndarray,
@@ -99,165 +294,387 @@ def constrained_kmeans(
     n_init: int = 10,
     random_state: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Run constrained K-Means; only the n_new new centers move.
-
-    Returns (new_centers, labels, inertia), where labels index into the
-    concatenated (fixed_centers, new_centers) array.
-    """
-    rng = np.random.default_rng(random_state)
+    """Constrained K-Means (Euclidean).  Returns (new_centers, labels, inertia)."""
+    rng     = np.random.default_rng(random_state)
     n_fixed = len(fixed_centers)
     best: tuple[np.ndarray, np.ndarray, float] | None = None
 
     for _ in range(n_init):
-        new_centers = kmeans_pp_init_with_fixed(
-            X, weights, fixed_centers, n_new, rng
-        )
-        prev_inertia = np.inf
+        nc   = _eu_kpp_init(X, weights, fixed_centers, n_new, rng)
+        prev = np.inf
 
         for _ in range(max_iter):
-            all_centers = np.vstack([fixed_centers, new_centers])
-            labels, sq_to_assigned = assign(X, all_centers)
-            inertia = float((weights * sq_to_assigned).sum())
+            all_c           = np.vstack([fixed_centers, nc])
+            lbl, sq         = _eu_assign(X, all_c)
+            inertia         = float((weights * sq).sum())
 
-            updated = new_centers.copy()
+            updated = nc.copy()
             for j in range(n_new):
-                mask = labels == (n_fixed + j)
+                mask = lbl == (n_fixed + j)
                 if mask.any():
-                    w = weights[mask]
-                    updated[j] = (X[mask] * w[:, None]).sum(axis=0) / w.sum()
+                    w          = weights[mask]
+                    updated[j] = (X[mask] * w[:, None]).sum(0) / w.sum()
                 else:
-                    # Empty cluster: re-seed at the demand farthest from any center.
-                    sq = _nearest_sq_dist(X, all_centers)
-                    updated[j] = X[np.argmax(weights * sq)]
+                    updated[j] = X[np.argmax(weights * _eu_nearest_sq(X, all_c))]
 
-            shift = np.sum((updated - new_centers) ** 2)
-            new_centers = updated
-            if abs(prev_inertia - inertia) < tol or shift < tol:
+            shift = float(np.sum((updated - nc) ** 2))
+            nc    = updated
+            if abs(prev - inertia) < tol or shift < tol:
                 break
-            prev_inertia = inertia
+            prev = inertia
 
-        all_centers = np.vstack([fixed_centers, new_centers])
-        labels, sq_to_assigned = assign(X, all_centers)
-        inertia = float((weights * sq_to_assigned).sum())
+        all_c   = np.vstack([fixed_centers, nc])
+        lbl, sq = _eu_assign(X, all_c)
+        inertia = float((weights * sq).sum())
         if best is None or inertia < best[2]:
-            best = (new_centers, labels, inertia)
+            best = (nc.copy(), lbl.copy(), inertia)
 
     assert best is not None
     return best
 
 
-# ---------- I/O & plotting -------------------------------------------------
+# ── Matrix-based core (network mode) ─────────────────────────────────────────
+
+def _mat_nearest(D: np.ndarray, cidxs: np.ndarray) -> np.ndarray:
+    return D[:, cidxs].min(axis=1)
 
 
-def load_points(
-    path: Path, x_col: str = "x", y_col: str = "y", weight_col: str = "weight"
+def _mat_assign(D: np.ndarray, cidxs: np.ndarray):
+    sub  = D[:, cidxs]
+    lbl  = np.argmin(sub, axis=1)
+    dist = sub[np.arange(len(D)), lbl]
+    return lbl, dist
+
+
+def _mat_kpp_init(
+    D: np.ndarray,
+    weights: np.ndarray,
+    fixed_idxs: np.ndarray,
+    n_new: int,
+    demand_idxs: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    md     = _mat_nearest(D, fixed_idxs)
+    chosen: list[int] = []
+    for _ in range(n_new):
+        scores = weights * md ** 2
+        tot    = scores.sum()
+        idx    = (int(rng.choice(demand_idxs))
+                  if tot <= 0
+                  else int(rng.choice(len(D), p=scores / tot)))
+        chosen.append(idx)
+        md = np.minimum(md, D[:, idx])
+    return np.array(chosen, dtype=int)
+
+
+def _medoid(D: np.ndarray, weights: np.ndarray, mask: np.ndarray) -> int:
+    """Index of the weighted medoid among masked rows.
+
+    Minimises sum_j  w_j · d(i, j)  over all members j in the cluster.
+    """
+    idxs = np.where(mask)[0]
+    if len(idxs) == 1:
+        return int(idxs[0])
+    sub  = D[np.ix_(idxs, idxs)]
+    # cost[row] = Σ_col  w[col] * d(row, col)
+    cost = (sub * weights[idxs]).sum(axis=1)
+    return int(idxs[np.argmin(cost)])
+
+
+def constrained_kmeans_matrix(
+    D: np.ndarray,
+    weights: np.ndarray,
+    n_fixed: int,
+    n_new: int,
+    max_iter: int = 300,
+    tol: float = 1e-6,
+    n_init: int = 10,
+    random_state: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Constrained K-Means using a precomputed distance matrix.
+
+    The first n_fixed rows/columns of D are existing supply (fixed centres).
+    The remaining rows are demand points.  Returns (new_center_indices, labels,
+    inertia) where indices point into the full D matrix.
+    """
+    rng         = np.random.default_rng(random_state)
+    fixed_idxs  = np.arange(n_fixed, dtype=int)
+    demand_idxs = np.arange(n_fixed, len(D), dtype=int)
+    best: tuple[np.ndarray, np.ndarray, float] | None = None
+
+    for _ in range(n_init):
+        nc_idxs = _mat_kpp_init(D, weights, fixed_idxs, n_new, demand_idxs, rng)
+        prev    = np.inf
+
+        for _ in range(max_iter):
+            all_c        = np.concatenate([fixed_idxs, nc_idxs])
+            lbl, dists   = _mat_assign(D, all_c)
+            inertia      = float((weights * dists).sum())
+
+            updated = nc_idxs.copy()
+            for j in range(n_new):
+                label_j = n_fixed + j
+                mask    = lbl == label_j
+                if mask.any():
+                    updated[j] = _medoid(D, weights, mask)
+                else:
+                    mind       = _mat_nearest(D, all_c)
+                    updated[j] = int(demand_idxs[
+                        np.argmax(weights[demand_idxs] * mind[demand_idxs])
+                    ])
+
+            shift   = int(np.sum(updated != nc_idxs))
+            nc_idxs = updated
+            if abs(prev - inertia) < tol or shift == 0:
+                break
+            prev = inertia
+
+        all_c      = np.concatenate([fixed_idxs, nc_idxs])
+        lbl, dists = _mat_assign(D, all_c)
+        inertia    = float((weights * dists).sum())
+        if best is None or inertia < best[2]:
+            best = (nc_idxs.copy(), lbl.copy(), inertia)
+
+    assert best is not None
+    return best
+
+
+# ── I/O ───────────────────────────────────────────────────────────────────────
+
+def _load(
+    path: Path,
+    x_col: str = "x",
+    y_col: str = "y",
+    weight_col: str = "weight",
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray | None]:
     df = pd.read_csv(path)
-    for col in (x_col, y_col):
-        if col not in df.columns:
-            raise ValueError(f"{path}: missing required column '{col}'")
-    coords = df[[x_col, y_col]].to_numpy(dtype=float)
-    weights = (
-        df[weight_col].to_numpy(dtype=float) if weight_col in df.columns else None
-    )
+    for c in (x_col, y_col):
+        if c not in df.columns:
+            raise ValueError(f"{path}: missing required column '{c}'")
+    coords  = df[[x_col, y_col]].to_numpy(float)
+    weights = df[weight_col].to_numpy(float) if weight_col in df.columns else None
     return df, coords, weights
 
 
-def plot_before_after(
-    X: np.ndarray,
-    fixed_centers: np.ndarray,
-    new_centers: np.ndarray,
-    labels_before: np.ndarray,
-    labels_after: np.ndarray,
-    save_path: Path | None,
+# ── plotting ──────────────────────────────────────────────────────────────────
+
+def _draw_network_edges(G, ax) -> None:
+    """Draw OSM edges lightly as background on ax.
+
+    G should be the *unprojected* (WGS-84) graph so its node coordinates
+    are already in lon/lat, matching the scatter-plot axes.
+    """
+    nodes_xy = {n: (d["x"], d["y"]) for n, d in G.nodes(data=True)}
+    for u, v, ed in G.edges(data=True):
+        if "geometry" in ed:
+            xs, ys = ed["geometry"].xy
+        else:
+            xs = [nodes_xy[u][0], nodes_xy[v][0]]
+            ys = [nodes_xy[u][1], nodes_xy[v][1]]
+        ax.plot(xs, ys, color="#cccccc", linewidth=0.5, zorder=1)
+
+
+def _plot(
+    demand_xy: np.ndarray,
+    fixed_xy: np.ndarray,
+    new_xy: np.ndarray,
+    lbl_before: np.ndarray,
+    lbl_after: np.ndarray,
+    save: Path | None,
+    space: SpaceType,
+    G=None,
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
-    cmap = "tab20"
 
-    axes[0].scatter(X[:, 0], X[:, 1], c=labels_before, s=18, cmap=cmap, alpha=0.7)
-    axes[0].scatter(
-        fixed_centers[:, 0], fixed_centers[:, 1],
-        marker="s", s=200, c="black", edgecolors="white", linewidths=1.5,
-        label="existing supply",
-    )
-    axes[0].set_title("Before — only existing supply")
-    axes[0].legend(loc="best")
+    if space == "network" and G is not None and _HAS_NET:
+        for ax in axes:
+            _draw_network_edges(G, ax)
 
-    axes[1].scatter(X[:, 0], X[:, 1], c=labels_after, s=18, cmap=cmap, alpha=0.7)
-    axes[1].scatter(
-        fixed_centers[:, 0], fixed_centers[:, 1],
-        marker="s", s=200, c="black", edgecolors="white", linewidths=1.5,
-        label="existing supply",
-    )
-    axes[1].scatter(
-        new_centers[:, 0], new_centers[:, 1],
-        marker="*", s=320, c="red", edgecolors="white", linewidths=1.5,
-        label="new supply",
-    )
-    axes[1].set_title("After — existing + new supply")
-    axes[1].legend(loc="best")
+    panels = [
+        (axes[0], lbl_before, "Before — existing supply only",     False),
+        (axes[1], lbl_after,  "After  — existing + new supply",    True),
+    ]
+    for ax, lbl, title, show_new in panels:
+        ax.scatter(demand_xy[:, 0], demand_xy[:, 1],
+                   c=lbl, s=18, cmap="tab20", alpha=0.8, zorder=3)
+        ax.scatter(fixed_xy[:, 0], fixed_xy[:, 1],
+                   marker="s", s=200, c="black", edgecolors="white", linewidths=1.5,
+                   label="existing supply", zorder=5)
+        if show_new:
+            ax.scatter(new_xy[:, 0], new_xy[:, 1],
+                       marker="*", s=320, c="red", edgecolors="white", linewidths=1.5,
+                       label="new supply", zorder=5)
+        ax.set_title(title)
+        ax.legend(loc="best")
 
+    xlabel, ylabel = (
+        ("lon", "lat") if space in ("geometric", "network") else ("x", "y")
+    )
     for ax in axes:
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
 
     fig.tight_layout()
-    if save_path is not None:
-        fig.savefig(save_path, dpi=150)
-        print(f"Saved figure to {save_path}")
+    if save:
+        fig.savefig(save, dpi=150)
+        print(f"Saved figure → {save}")
     plt.show()
 
 
-# ---------- CLI ------------------------------------------------------------
-
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--demand", type=Path, required=True, help="demand CSV (x,y[,weight,...])")
-    parser.add_argument("--supply", type=Path, required=True, help="existing supply CSV (x,y,...)")
-    parser.add_argument("--n-new", type=int, required=True, help="number of new centers to add")
-    parser.add_argument("--output", type=Path, default=Path("demand_clustered.csv"))
-    parser.add_argument("--figure", type=Path, default=Path("clusters_before_after.png"))
-    parser.add_argument("--n-init", type=int, default=10)
-    parser.add_argument("--max-iter", type=int, default=300)
-    parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args()
-
-    demand_df, X, weights = load_points(args.demand)
-    if weights is None:
-        weights = np.ones(len(X))
-    _, fixed_centers, _ = load_points(args.supply)
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--demand",       type=Path, required=True,
+                    help="demand CSV  (columns: x/lon, y/lat, optional weight, …)")
+    ap.add_argument("--supply",       type=Path, required=True,
+                    help="existing supply CSV  (columns: x/lon, y/lat)")
+    ap.add_argument("--n-new",        type=int,  required=True,
+                    help="number of new supply centres to add")
+    ap.add_argument("--space",        choices=["euclidean", "geometric", "network"],
+                    default="euclidean",
+                    help="distance space  [default: euclidean]")
+    ap.add_argument("--network-type", default="drive",
+                    help="OSMnx network type: drive / walk / bike / all  [default: drive]")
+    ap.add_argument("--buffer",       type=float, default=500,
+                    help="extra metres to buffer OSM bounding box  [default: 500]")
+    ap.add_argument("--output",       type=Path, default=Path("demand_clustered.csv"))
+    ap.add_argument("--figure",       type=Path, default=Path("clusters_before_after.png"))
+    ap.add_argument("--n-init",       type=int,  default=10)
+    ap.add_argument("--max-iter",     type=int,  default=300)
+    ap.add_argument("--seed",         type=int,  default=0)
+    args = ap.parse_args()
 
     if args.n_new < 1:
         raise SystemExit("--n-new must be >= 1")
 
-    # Before: assign each demand to its nearest *existing* supply.
-    labels_before, _ = assign(X, fixed_centers)
+    demand_df, demand_coords, demand_weights = _load(args.demand)
+    if demand_weights is None:
+        demand_weights = np.ones(len(demand_coords))
+    _, supply_coords, _ = _load(args.supply)
+    n_supply = len(supply_coords)
 
-    # Solve for new centers.
-    new_centers, labels_after, inertia = constrained_kmeans(
-        X, weights, fixed_centers, args.n_new,
-        max_iter=args.max_iter, n_init=args.n_init, random_state=args.seed,
-    )
-    n_fixed = len(fixed_centers)
+    # ── run algorithm ─────────────────────────────────────────────────────────
 
-    print(f"Final inertia (weighted SSE): {inertia:.4f}")
+    G_plot     = None   # unprojected graph kept for plotting (network mode)
+    snaps_demand: list[EdgeSnap] | None = None
+
+    if args.space == "euclidean":
+        X, FC = demand_coords, supply_coords
+
+        lbl_before, _                  = _eu_assign(X, FC)
+        new_c, lbl_after, inertia      = constrained_kmeans_euclidean(
+            X, demand_weights, FC, args.n_new,
+            max_iter=args.max_iter, n_init=args.n_init, random_state=args.seed,
+        )
+        demand_xy, fixed_xy, new_xy = X, FC, new_c
+
+    elif args.space == "geometric":
+        all_lons = np.concatenate([demand_coords[:, 0], supply_coords[:, 0]])
+        all_lats = np.concatenate([demand_coords[:, 1], supply_coords[:, 1]])
+        fwd, inv = _make_utm_projectors(all_lons, all_lats)
+
+        dx, dy = fwd.transform(demand_coords[:, 0], demand_coords[:, 1])
+        sx, sy = fwd.transform(supply_coords[:, 0], supply_coords[:, 1])
+        X, FC  = np.column_stack([dx, dy]), np.column_stack([sx, sy])
+
+        lbl_before, _              = _eu_assign(X, FC)
+        new_c_proj, lbl_after, inertia = constrained_kmeans_euclidean(
+            X, demand_weights, FC, args.n_new,
+            max_iter=args.max_iter, n_init=args.n_init, random_state=args.seed,
+        )
+        # back-project new centres to lon/lat for output & plotting
+        nc_lons, nc_lats = inv.transform(new_c_proj[:, 0], new_c_proj[:, 1])
+        new_c            = np.column_stack([nc_lons, nc_lats])
+
+        demand_xy = demand_coords   # original lon/lat for plot
+        fixed_xy  = supply_coords
+        new_xy    = new_c
+
+    elif args.space == "network":
+        all_lons = np.concatenate([demand_coords[:, 0], supply_coords[:, 0]])
+        all_lats = np.concatenate([demand_coords[:, 1], supply_coords[:, 1]])
+
+        G_plot, G_proj = _fetch_graph(
+            all_lons, all_lats,
+            network_type=args.network_type,
+            buffer_m=args.buffer,
+        )
+
+        # Forward-project all points into G_proj's CRS
+        graph_crs = G_proj.graph.get("crs")
+        if graph_crs and _HAS_PROJ:
+            fwd_proj  = _Transformer.from_crs("EPSG:4326", graph_crs, always_xy=True)
+            back_proj = _Transformer.from_crs(graph_crs, "EPSG:4326", always_xy=True)
+            dx, dy    = fwd_proj.transform(demand_coords[:, 0], demand_coords[:, 1])
+            sx, sy    = fwd_proj.transform(supply_coords[:, 0], supply_coords[:, 1])
+        else:
+            # Fallback: use local UTM
+            fwd_utm, back_proj = _make_utm_projectors(all_lons, all_lats)
+            dx, dy = fwd_utm.transform(demand_coords[:, 0], demand_coords[:, 1])
+            sx, sy = fwd_utm.transform(supply_coords[:, 0], supply_coords[:, 1])
+
+        # Snap: supply first, then demand (so indices align with D rows)
+        all_px = np.concatenate([sx, dx])
+        all_py = np.concatenate([sy, dy])
+        print(f"Snapping {len(all_px)} points to nearest edge …")
+        all_snaps    = _snap_to_edges(G_proj, all_px, all_py, back_proj)
+        snaps_supply = all_snaps[:n_supply]
+        snaps_demand = all_snaps[n_supply:]
+
+        # Precompute node-to-node distances, then full distance matrix
+        nd = _precompute_node_dists(G_proj, all_snaps)
+        print(f"Building {len(all_snaps)}×{len(all_snaps)} network distance matrix …")
+        D = _build_dist_matrix(all_snaps, nd)
+
+        # Supply rows get weight 0 (they are fixed, not demand)
+        w_full = np.concatenate([np.zeros(n_supply), demand_weights])
+
+        nc_idxs, lbl_all, inertia = constrained_kmeans_matrix(
+            D, w_full, n_fixed=n_supply, n_new=args.n_new,
+            max_iter=args.max_iter, n_init=args.n_init, random_state=args.seed,
+        )
+
+        # lbl_all indices: 0..n_supply-1 = existing supply, n_supply.. = new
+        lbl_after  = lbl_all[n_supply:]                         # demand only
+        lbl_before = np.argmin(D[n_supply:, :n_supply], axis=1) # demand vs supply
+
+        # Resolve snapped positions for new centres and plotting
+        new_snaps = [all_snaps[i] for i in nc_idxs]
+        new_c     = np.array([[s.snap_lon, s.snap_lat] for s in new_snaps])
+        demand_xy = np.array([[s.snap_lon, s.snap_lat] for s in snaps_demand])
+        fixed_xy  = np.array([[s.snap_lon, s.snap_lat] for s in snaps_supply])
+        new_xy    = new_c
+
+    else:
+        raise SystemExit(f"Unknown space: {args.space}")
+
+    # ── report ────────────────────────────────────────────────────────────────
+
+    print(f"\nFinal inertia (weighted distance): {inertia:.4f}")
     print("New supply locations:")
-    for i, c in enumerate(new_centers):
-        print(f"  new_{i} (cluster {n_fixed + i}): x={c[0]:.4f}, y={c[1]:.4f}")
+    for i, c in enumerate(new_c):
+        if args.space == "euclidean":
+            print(f"  new_{i}  (cluster {n_supply + i}):  x={c[0]:.4f}  y={c[1]:.4f}")
+        else:
+            print(f"  new_{i}  (cluster {n_supply + i}):  lon={c[0]:.6f}  lat={c[1]:.6f}")
 
-    # Write CSV: preserve original demand columns, append cluster info.
-    out_df = demand_df.copy()
-    out_df["cluster_before"] = labels_before
-    out_df["cluster_after"] = labels_after
-    out_df["is_new_cluster"] = labels_after >= n_fixed
+    # ── save CSV ──────────────────────────────────────────────────────────────
+
+    out_df                  = demand_df.copy()
+    out_df["cluster_before"] = lbl_before
+    out_df["cluster_after"]  = lbl_after
+    out_df["is_new_cluster"] = lbl_after >= n_supply
+    if args.space == "network" and snaps_demand is not None:
+        out_df["snap_lon"] = [s.snap_lon for s in snaps_demand]
+        out_df["snap_lat"] = [s.snap_lat for s in snaps_demand]
     out_df.to_csv(args.output, index=False)
-    print(f"Saved cluster assignments to {args.output}")
+    print(f"Saved assignments → {args.output}")
 
-    plot_before_after(
-        X, fixed_centers, new_centers, labels_before, labels_after, args.figure
-    )
+    # ── plot ──────────────────────────────────────────────────────────────────
+
+    _plot(demand_xy, fixed_xy, new_xy, lbl_before, lbl_after,
+          args.figure, args.space, G=G_plot)
 
 
 if __name__ == "__main__":
