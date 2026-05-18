@@ -1,0 +1,4 @@
+id,name,x,y
+S0,depot_A,0.2,-0.1
+S1,depot_B,10.1,0.4
+S2,depot_C,-0.3,9.8

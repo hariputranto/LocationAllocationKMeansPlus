@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(MPLBACKEND=Agg python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 2 --seed 0)",
+      "Bash(pip install *)"
+    ]
+  }
+}
