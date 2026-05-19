@@ -11,14 +11,15 @@ Place **N new supply facilities** optimally among existing demand points, withou
 - **Three distance spaces** — choose the one that matches your data
 - **Edge snapping** *(network mode)* — demand and supply points are snapped to the nearest OSM street segment; new centres are placed on the network, not in free space
 - **Before / after visualisation** — side-by-side map saved automatically
-- **Multiple restarts** (`--n-init`) — best solution across runs is kept
+- **Multiple restarts** (`N_INIT`) — best solution across runs is kept
+- **Config-driven** — all parameters are plain variables at the top of each script; no CLI flags needed
 
 ---
 
 ## Distance Spaces
 
-| `--space` | How distance is measured | Coordinate input | Extra deps |
-|-----------|--------------------------|------------------|------------|
+| `SPACE` | How distance is measured | Coordinate input | Extra deps |
+|---------|--------------------------|------------------|------------|
 | `euclidean` | Straight-line in x/y | any units | — |
 | `geometric` | Straight-line in **metres** (UTM projected) | longitude / latitude | `pyproj` |
 | `network` | **Shortest-path** along OSM streets in metres | longitude / latitude | `osmnx networkx shapely pyproj` |
@@ -58,8 +59,8 @@ pip install osmnx networkx shapely pyproj
 | Column | Required | Description |
 |--------|----------|-------------|
 | `x` | yes | x-coordinate (or **longitude** for geometric/network) |
-| `y` | yes | y-coordinate (or **latitude**  for geometric/network) |
-| `weight` | no | demand weight (defaults to 1 if omitted) |
+| `y` | yes | y-coordinate (or **latitude** for geometric/network) |
+| `weight` | no | demand weight (defaults to 1 if omitted or `WEIGHT_COL = ""`) |
 | any others | no | preserved as-is in the output CSV |
 
 ### `supply.csv`
@@ -74,38 +75,28 @@ pip install osmnx networkx shapely pyproj
 
 ## Usage
 
+Edit the config block at the top of `kmeans_pp.py`, then run:
+
 ```bash
-# Euclidean space (plain x/y coordinates)
-python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 2
-
-# Geometric space (lon/lat → UTM, distances in metres)
-python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 2 \
-    --space geometric
-
-# Network space (OSM street network, distances in metres)
-python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 2 \
-    --space network
-
-# Network space — walking network, 1 km OSM buffer
-python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 3 \
-    --space network --network-type walk --buffer 1000
+python kmeans_pp.py
 ```
 
-### All arguments
+### Configuration variables (`kmeans_pp.py`)
 
-| Argument | Default | Description |
+| Variable | Default | Description |
 |----------|---------|-------------|
-| `--demand` | *(required)* | Path to demand CSV |
-| `--supply` | *(required)* | Path to existing supply CSV |
-| `--n-new` | *(required)* | Number of new supply centres to add |
-| `--space` | `euclidean` | Distance space: `euclidean` / `geometric` / `network` |
-| `--network-type` | `drive` | OSMnx network type: `drive` / `walk` / `bike` / `all` |
-| `--buffer` | `500` | Extra metres to pad the OSM bounding box |
-| `--n-init` | `10` | Number of random restarts (best result kept) |
-| `--max-iter` | `300` | Max Lloyd iterations per restart |
-| `--seed` | `0` | Random seed for reproducibility |
-| `--output` | `demand_clustered.csv` | Path for output CSV |
-| `--figure` | `clusters_before_after.png` | Path for output figure |
+| `DEMAND` | `demand.csv` | Path to demand CSV |
+| `SUPPLY` | `supply.csv` | Path to existing supply CSV |
+| `N_NEW` | `2` | Number of new supply centres to add |
+| `SPACE` | `euclidean` | Distance space: `euclidean` / `geometric` / `network` |
+| `WEIGHT_COL` | `weight` | Column in demand CSV to use as weight; set to `""` to ignore |
+| `NETWORK_TYPE` | `drive` | OSM network type: `drive` / `walk` / `bike` / `all` |
+| `BUFFER` | `500` | Extra metres to pad the OSM bounding box |
+| `N_INIT` | `10` | Number of random restarts (best result kept) |
+| `MAX_ITER` | `300` | Max Lloyd iterations per restart |
+| `SEED` | `0` | Random seed for reproducibility |
+| `OUTPUT` | `demand_clustered.csv` | Path for output CSV |
+| `FIGURE` | `clusters_before_after.png` | Path for output figure |
 
 ---
 
@@ -121,7 +112,7 @@ Original demand columns plus:
 | `cluster_after` | Cluster index after adding new supply (indices `>= n_existing` are new) |
 | `is_new_cluster` | `True` if the demand point is now served by a new centre |
 | `snap_lon` | *(network mode only)* Longitude of the snapped demand position on the network |
-| `snap_lat` | *(network mode only)* Latitude  of the snapped demand position on the network |
+| `snap_lat` | *(network mode only)* Latitude of the snapped demand position on the network |
 
 ### Figure (`clusters_before_after.png`)
 
@@ -133,12 +124,34 @@ Two side-by-side panels:
 
 ## Quick-start with demo data
 
-```bash
-# Generate synthetic demand (500 points, 5 blobs) and supply (3 existing depots)
-python make_demo_data.py
+### 1. Configure and generate demo data
 
-# Run — existing supply covers 3 blobs; add 2 new centres for the uncovered blobs
-python kmeans_pp.py --demand demand.csv --supply supply.csv --n-new 2
+Edit the config block at the top of `make_demo_data.py`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BLOB_CENTERS` | 5 blobs | List of `[x, y]` blob centre coordinates |
+| `N_SAMPLES` | `500` | Total demand points spread across all blobs |
+| `BLOB_STD` | `0.8` | Spread (standard deviation) of each blob |
+| `WEIGHT_MIN` / `WEIGHT_MAX` | `1` / `10` | Range for random demand weights |
+| `SEED` | `42` | Random seed |
+| `SUPPLY_OFFSETS` | 3 offsets | One `[dx, dy]` per covered blob; shorten to leave more blobs uncovered |
+| `SUPPLY_NAMES` | `depot_A/B/C` | Names for each supply depot |
+| `DEMAND_OUTPUT` | `demand.csv` | Output demand CSV filename |
+| `SUPPLY_OUTPUT` | `supply.csv` | Output supply CSV filename |
+
+Then run:
+
+```bash
+python make_demo_data.py
+```
+
+The script prints the suggested `N_NEW` value to use in `kmeans_pp.py`.
+
+### 2. Run the analysis
+
+```bash
+python kmeans_pp.py
 ```
 
 ---
@@ -161,9 +174,9 @@ where `D(x)` is the distance from **x** to the nearest already-placed centre (ex
 2. **Update** only the new centres:
    - *Euclidean / geometric*: weighted mean of assigned demand coordinates.
    - *Network*: weighted **medoid** — the assigned demand point that minimises `Σ w_j · d(i, j)` over all cluster members.
-3. Repeat until convergence (`--max-iter` cap) or centre positions stop changing.
+3. Repeat until convergence (`MAX_ITER` cap) or centre positions stop changing.
 
-The best result across `--n-init` independent restarts is returned.
+The best result across `N_INIT` independent restarts is returned.
 
 ### Network distance computation
 
