@@ -1,0 +1,33 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "restricted_area_1" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [9.0, 9.0],
+          [11.5, 9.0],
+          [11.5, 11.5],
+          [9.0, 11.5],
+          [9.0, 9.0]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "restricted_area_2" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [4.0, 4.0],
+          [6.0, 4.0],
+          [6.0, 6.0],
+          [4.0, 6.0],
+          [4.0, 4.0]
+        ]]
+      }
+    }
+  ]
+}

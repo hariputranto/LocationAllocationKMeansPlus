@@ -76,8 +76,15 @@ N_INIT       = 10                   # random restarts — best result is kept
 MAX_ITER     = 300                  # max Lloyd iterations per restart
 SEED         = 0                    # random seed for reproducibility
 
-OUTPUT       = "demand_clustered.csv"       # output CSV path
-FIGURE       = "clusters_before_after.png"  # output figure path
+OUTPUT         = "demand_clustered.csv"       # demand assignments output CSV
+CENTRES_OUTPUT = "new_centres.csv"           # new supply centres output CSV
+FIGURE         = "clusters_before_after.png"  # output figure path
+
+# Polygon exclusion zones — new supply centres will NOT be placed inside these areas.
+# Set to a path to a GeoJSON file containing Polygon / MultiPolygon features,
+# or "" to disable.  Coordinates must match the input space (x/y for euclidean,
+# lon/lat for geometric and network).
+EXCLUSION_ZONES = "exclusion_zones.geojson"   # e.g. "exclusion_zones.geojson"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -139,6 +146,28 @@ def _make_utm_projectors(all_lons: np.ndarray, all_lats: np.ndarray):
     fwd  = _Transformer.from_crs("EPSG:4326", utm, always_xy=True)
     inv  = _Transformer.from_crs(utm, "EPSG:4326", always_xy=True)
     return fwd, inv
+
+
+# ── Exclusion zone helpers ────────────────────────────────────────────────────
+
+def _load_exclusion_zones(path: str | Path) -> list:
+    """Load Polygon / MultiPolygon geometries from a GeoJSON file."""
+    import json
+    from shapely.geometry import shape
+    with open(path) as f:
+        fc = json.load(f)
+    features = fc["features"] if fc.get("type") == "FeatureCollection" else [fc]
+    return [shape(feat.get("geometry", feat)) for feat in features]
+
+
+def _exclusion_mask(coords_xy: np.ndarray, zones: list) -> np.ndarray:
+    """Boolean array: True where point falls inside any exclusion zone."""
+    from shapely.geometry import Point
+    mask = np.zeros(len(coords_xy), dtype=bool)
+    for i, (x, y) in enumerate(coords_xy):
+        pt = Point(x, y)
+        mask[i] = any(z.contains(pt) for z in zones)
+    return mask
 
 
 # ── OSMnx / network helpers ───────────────────────────────────────────────────
@@ -299,16 +328,22 @@ def _eu_kpp_init(
     fixed_centers: np.ndarray,
     n_new: int,
     rng: np.random.Generator,
+    excluded: np.ndarray | None = None,
 ) -> np.ndarray:
-    n, k = X.shape
-    nc   = np.empty((n_new, k))
-    sq   = _eu_nearest_sq(X, fixed_centers)
+    n, k   = X.shape
+    nc     = np.empty((n_new, k))
+    sq     = _eu_nearest_sq(X, fixed_centers)
+    valid  = np.where(~excluded)[0] if excluded is not None else np.arange(n)
     for i in range(n_new):
         scores = weights * sq
-        tot    = scores.sum()
-        idx    = int(rng.integers(n) if tot <= 0 else rng.choice(n, p=scores / tot))
-        nc[i]  = X[idx]
-        sq     = np.minimum(sq, np.sum((X - nc[i]) ** 2, axis=1))
+        if excluded is not None:
+            scores = scores.copy()
+            scores[excluded] = 0.0
+        tot   = scores.sum()
+        idx   = int(rng.choice(valid) if tot <= 0
+                    else rng.choice(n, p=scores / tot))
+        nc[i] = X[idx]
+        sq    = np.minimum(sq, np.sum((X - nc[i]) ** 2, axis=1))
     return nc
 
 
@@ -321,6 +356,7 @@ def constrained_kmeans_euclidean(
     tol: float = 1e-6,
     n_init: int = 10,
     random_state: int | None = None,
+    excluded: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Constrained K-Means (Euclidean).  Returns (new_centers, labels, inertia)."""
     rng     = np.random.default_rng(random_state)
@@ -328,20 +364,32 @@ def constrained_kmeans_euclidean(
     best: tuple[np.ndarray, np.ndarray, float] | None = None
 
     for _ in range(n_init):
-        nc   = _eu_kpp_init(X, weights, fixed_centers, n_new, rng)
+        nc   = _eu_kpp_init(X, weights, fixed_centers, n_new, rng, excluded=excluded)
         prev = np.inf
 
         for _ in range(max_iter):
-            all_c           = np.vstack([fixed_centers, nc])
-            lbl, sq         = _eu_assign(X, all_c)
-            inertia         = float((weights * sq).sum())
+            all_c   = np.vstack([fixed_centers, nc])
+            lbl, sq = _eu_assign(X, all_c)
+            inertia = float((weights * sq).sum())
 
             updated = nc.copy()
             for j in range(n_new):
-                mask = lbl == (n_fixed + j)
-                if mask.any():
-                    w          = weights[mask]
-                    updated[j] = (X[mask] * w[:, None]).sum(0) / w.sum()
+                mask  = lbl == (n_fixed + j)
+                valid = mask & ~excluded if excluded is not None else mask
+                if not valid.any():
+                    valid = mask   # all cluster members excluded — fall back
+                if valid.any():
+                    w      = weights[valid]
+                    mean_c = (X[valid] * w[:, None]).sum(0) / w.sum()
+                    if excluded is not None:
+                        # The weighted mean is a free point that can fall inside
+                        # an exclusion zone even when computed from non-excluded
+                        # demand points.  Snap to the nearest non-excluded demand
+                        # point in the cluster to guarantee the centre is valid.
+                        dists      = np.sum((X[valid] - mean_c) ** 2, axis=1)
+                        updated[j] = X[valid][np.argmin(dists)]
+                    else:
+                        updated[j] = mean_c
                 else:
                     updated[j] = X[np.argmax(weights * _eu_nearest_sq(X, all_c))]
 
@@ -381,32 +429,47 @@ def _mat_kpp_init(
     n_new: int,
     demand_idxs: np.ndarray,
     rng: np.random.Generator,
+    excluded: np.ndarray | None = None,
 ) -> np.ndarray:
-    md     = _mat_nearest(D, fixed_idxs)
+    md          = _mat_nearest(D, fixed_idxs)
+    valid_didxs = demand_idxs if excluded is None else demand_idxs[~excluded]
+    if len(valid_didxs) == 0:
+        valid_didxs = demand_idxs
     chosen: list[int] = []
     for _ in range(n_new):
         scores = weights * md ** 2
-        tot    = scores.sum()
-        idx    = (int(rng.choice(demand_idxs))
-                  if tot <= 0
-                  else int(rng.choice(len(D), p=scores / tot)))
+        if excluded is not None:
+            scores = scores.copy()
+            scores[demand_idxs[excluded]] = 0.0
+        tot = scores.sum()
+        idx = (int(rng.choice(valid_didxs))
+               if tot <= 0
+               else int(rng.choice(len(D), p=scores / tot)))
         chosen.append(idx)
         md = np.minimum(md, D[:, idx])
     return np.array(chosen, dtype=int)
 
 
-def _medoid(D: np.ndarray, weights: np.ndarray, mask: np.ndarray) -> int:
-    """Index of the weighted medoid among masked rows.
+def _medoid(
+    D: np.ndarray,
+    weights: np.ndarray,
+    mask: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+) -> int:
+    """Weighted medoid: minimises Σ w_j·d(i,j) over all cluster members j.
 
-    Minimises sum_j  w_j · d(i, j)  over all members j in the cluster.
+    Candidates are restricted to valid_mask if provided (non-excluded points).
+    Cost is always computed against all cluster members (mask).
     """
-    idxs = np.where(mask)[0]
-    if len(idxs) == 1:
-        return int(idxs[0])
-    sub  = D[np.ix_(idxs, idxs)]
-    # cost[row] = Σ_col  w[col] * d(row, col)
-    cost = (sub * weights[idxs]).sum(axis=1)
-    return int(idxs[np.argmin(cost)])
+    all_idxs  = np.where(mask)[0]
+    cand_idxs = np.where(valid_mask)[0] if valid_mask is not None else all_idxs
+    if len(cand_idxs) == 0:
+        cand_idxs = all_idxs   # all excluded — fall back
+    if len(cand_idxs) == 1:
+        return int(cand_idxs[0])
+    sub  = D[np.ix_(cand_idxs, all_idxs)]
+    cost = (sub * weights[all_idxs]).sum(axis=1)
+    return int(cand_idxs[np.argmin(cost)])
 
 
 def constrained_kmeans_matrix(
@@ -418,37 +481,52 @@ def constrained_kmeans_matrix(
     tol: float = 1e-6,
     n_init: int = 10,
     random_state: int | None = None,
+    excluded: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Constrained K-Means using a precomputed distance matrix.
 
     The first n_fixed rows/columns of D are existing supply (fixed centres).
     The remaining rows are demand points.  Returns (new_center_indices, labels,
     inertia) where indices point into the full D matrix.
+    excluded: boolean array of length n_demand; True = cannot host a new centre.
     """
     rng         = np.random.default_rng(random_state)
     fixed_idxs  = np.arange(n_fixed, dtype=int)
     demand_idxs = np.arange(n_fixed, len(D), dtype=int)
     best: tuple[np.ndarray, np.ndarray, float] | None = None
 
+    # Full-length exclusion mask (supply rows always False)
+    full_excl: np.ndarray | None = None
+    if excluded is not None:
+        full_excl = np.zeros(len(D), dtype=bool)
+        full_excl[demand_idxs[excluded]] = True
+
+    valid_didxs = demand_idxs if excluded is None else demand_idxs[~excluded]
+    if len(valid_didxs) == 0:
+        valid_didxs = demand_idxs
+
     for _ in range(n_init):
-        nc_idxs = _mat_kpp_init(D, weights, fixed_idxs, n_new, demand_idxs, rng)
-        prev    = np.inf
+        nc_idxs = _mat_kpp_init(
+            D, weights, fixed_idxs, n_new, demand_idxs, rng, excluded=excluded
+        )
+        prev = np.inf
 
         for _ in range(max_iter):
-            all_c        = np.concatenate([fixed_idxs, nc_idxs])
-            lbl, dists   = _mat_assign(D, all_c)
-            inertia      = float((weights * dists).sum())
+            all_c      = np.concatenate([fixed_idxs, nc_idxs])
+            lbl, dists = _mat_assign(D, all_c)
+            inertia    = float((weights * dists).sum())
 
             updated = nc_idxs.copy()
             for j in range(n_new):
                 label_j = n_fixed + j
                 mask    = lbl == label_j
                 if mask.any():
-                    updated[j] = _medoid(D, weights, mask)
+                    valid_mask = (mask & ~full_excl) if full_excl is not None else None
+                    updated[j] = _medoid(D, weights, mask, valid_mask=valid_mask)
                 else:
                     mind       = _mat_nearest(D, all_c)
-                    updated[j] = int(demand_idxs[
-                        np.argmax(weights[demand_idxs] * mind[demand_idxs])
+                    updated[j] = int(valid_didxs[
+                        np.argmax(weights[valid_didxs] * mind[valid_didxs])
                     ])
 
             shift   = int(np.sum(updated != nc_idxs))
@@ -502,6 +580,26 @@ def _draw_network_edges(G, ax) -> None:
         ax.plot(xs, ys, color="#cccccc", linewidth=0.5, zorder=1)
 
 
+def _draw_exclusion_zones(zones: list, ax) -> None:
+    """Shade exclusion polygons as semi-transparent red hatched areas."""
+    from shapely.geometry import MultiPolygon
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as MplPath
+
+    for zone in zones:
+        polys = zone.geoms if isinstance(zone, MultiPolygon) else [zone]
+        for poly in polys:
+            coords = list(poly.exterior.coords)
+            codes  = ([MplPath.MOVETO] +
+                      [MplPath.LINETO] * (len(coords) - 2) +
+                      [MplPath.CLOSEPOLY])
+            path  = MplPath(coords, codes)
+            patch = PathPatch(path, facecolor="red", edgecolor="darkred",
+                              alpha=0.25, linewidth=1.2, zorder=4,
+                              label="exclusion zone")
+            ax.add_patch(patch)
+
+
 def _plot(
     demand_xy: np.ndarray,
     fixed_xy: np.ndarray,
@@ -511,6 +609,7 @@ def _plot(
     save: Path | None,
     space: SpaceType,
     G=None,
+    zones: list | None = None,
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
 
@@ -519,8 +618,8 @@ def _plot(
             _draw_network_edges(G, ax)
 
     panels = [
-        (axes[0], lbl_before, "Before — existing supply only",     False),
-        (axes[1], lbl_after,  "After  — existing + new supply",    True),
+        (axes[0], lbl_before, "Before — existing supply only",  False),
+        (axes[1], lbl_after,  "After  — existing + new supply", True),
     ]
     for ax, lbl, title, show_new in panels:
         ax.scatter(demand_xy[:, 0], demand_xy[:, 1],
@@ -532,6 +631,8 @@ def _plot(
             ax.scatter(new_xy[:, 0], new_xy[:, 1],
                        marker="*", s=320, c="red", edgecolors="white", linewidths=1.5,
                        label="new supply", zorder=5)
+        if zones:
+            _draw_exclusion_zones(zones, ax)
         ax.set_title(title)
         ax.legend(loc="best")
 
@@ -562,8 +663,9 @@ def main() -> None:
     n_init       = int(N_INIT)
     max_iter     = int(MAX_ITER)
     seed         = int(SEED)
-    output       = Path(OUTPUT)
-    figure       = Path(FIGURE)
+    output         = Path(OUTPUT)
+    centres_output = Path(CENTRES_OUTPUT)
+    figure         = Path(FIGURE)
 
     if n_new < 1:
         raise SystemExit("N_NEW must be >= 1")
@@ -578,6 +680,18 @@ def main() -> None:
     _, supply_coords, _ = _load(supply_path)
     n_supply = len(supply_coords)
 
+    # ── exclusion zones ───────────────────────────────────────────────────────
+
+    zones: list = []
+    excl_mask = np.zeros(len(demand_coords), dtype=bool)
+    if EXCLUSION_ZONES:
+        zones     = _load_exclusion_zones(EXCLUSION_ZONES)
+        excl_mask = _exclusion_mask(demand_coords, zones)
+        n_excl    = int(excl_mask.sum())
+        print(f"Exclusion zones: {len(zones)} polygon(s) loaded, "
+              f"{n_excl} demand point(s) excluded as centre candidates")
+    excluded = excl_mask if excl_mask.any() else None
+
     # ── run algorithm ─────────────────────────────────────────────────────────
 
     G_plot     = None   # unprojected graph kept for plotting (network mode)
@@ -589,7 +703,7 @@ def main() -> None:
         lbl_before, _             = _eu_assign(X, FC)
         new_c, lbl_after, inertia = constrained_kmeans_euclidean(
             X, demand_weights, FC, n_new,
-            max_iter=max_iter, n_init=n_init, random_state=seed,
+            max_iter=max_iter, n_init=n_init, random_state=seed, excluded=excluded,
         )
         demand_xy, fixed_xy, new_xy = X, FC, new_c
 
@@ -605,7 +719,7 @@ def main() -> None:
         lbl_before, _                  = _eu_assign(X, FC)
         new_c_proj, lbl_after, inertia = constrained_kmeans_euclidean(
             X, demand_weights, FC, n_new,
-            max_iter=max_iter, n_init=n_init, random_state=seed,
+            max_iter=max_iter, n_init=n_init, random_state=seed, excluded=excluded,
         )
         nc_lons, nc_lats = inv.transform(new_c_proj[:, 0], new_c_proj[:, 1])
         new_c            = np.column_stack([nc_lons, nc_lats])
@@ -650,7 +764,7 @@ def main() -> None:
 
         nc_idxs, lbl_all, inertia = constrained_kmeans_matrix(
             D, w_full, n_fixed=n_supply, n_new=n_new,
-            max_iter=max_iter, n_init=n_init, random_state=seed,
+            max_iter=max_iter, n_init=n_init, random_state=seed, excluded=excluded,
         )
 
         lbl_after  = lbl_all[n_supply:]
@@ -687,10 +801,35 @@ def main() -> None:
     out_df.to_csv(output, index=False)
     print(f"Saved assignments → {output}")
 
+    # ── save new centres CSV ──────────────────────────────────────────────────
+
+    rows = []
+    for i, c in enumerate(new_c):
+        cluster_id = n_supply + i
+        mask       = lbl_after == cluster_id
+        n_demand   = int(mask.sum())
+        total_w    = float(demand_weights[mask].sum())
+        mean_w     = float(total_w / n_demand) if n_demand > 0 else 0.0
+        row: dict = {"cluster_id": cluster_id}
+        if space == "euclidean":
+            row["x"] = round(float(c[0]), 6)
+            row["y"] = round(float(c[1]), 6)
+        else:
+            row["lon"] = round(float(c[0]), 6)
+            row["lat"] = round(float(c[1]), 6)
+        row["n_demand"]    = n_demand
+        row["total_weight"] = round(total_w, 4)
+        row["mean_weight"]  = round(mean_w, 4)
+        rows.append(row)
+
+    centres_df = pd.DataFrame(rows)
+    centres_df.to_csv(centres_output, index=False)
+    print(f"Saved new centres  → {centres_output}")
+
     # ── plot ──────────────────────────────────────────────────────────────────
 
     _plot(demand_xy, fixed_xy, new_xy, lbl_before, lbl_after,
-          figure, space, G=G_plot)
+          figure, space, G=G_plot, zones=zones or None)
 
 
 if __name__ == "__main__":

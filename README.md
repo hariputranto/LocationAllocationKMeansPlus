@@ -95,14 +95,15 @@ python kmeans_pp.py
 | `N_INIT` | `10` | Number of random restarts (best result kept) |
 | `MAX_ITER` | `300` | Max Lloyd iterations per restart |
 | `SEED` | `0` | Random seed for reproducibility |
-| `OUTPUT` | `demand_clustered.csv` | Path for output CSV |
+| `OUTPUT` | `demand_clustered.csv` | Path for demand assignments output CSV |
+| `CENTRES_OUTPUT` | `new_centres.csv` | Path for new supply centres output CSV |
 | `FIGURE` | `clusters_before_after.png` | Path for output figure |
 
 ---
 
 ## Output
 
-### CSV (`demand_clustered.csv`)
+### Demand assignments (`demand_clustered.csv`)
 
 Original demand columns plus:
 
@@ -113,6 +114,19 @@ Original demand columns plus:
 | `is_new_cluster` | `True` if the demand point is now served by a new centre |
 | `snap_lon` | *(network mode only)* Longitude of the snapped demand position on the network |
 | `snap_lat` | *(network mode only)* Latitude of the snapped demand position on the network |
+
+### New supply centres (`new_centres.csv`)
+
+One row per new supply centre:
+
+| Column | Description |
+|--------|-------------|
+| `cluster_id` | Cluster index this centre represents (always `>= n_existing`) |
+| `x`, `y` | Coordinates *(euclidean mode only)* |
+| `lon`, `lat` | Coordinates *(geometric / network mode only)* |
+| `n_demand` | Number of demand points assigned to this centre after optimisation |
+| `total_weight` | Sum of demand weights assigned to this centre |
+| `mean_weight` | Average demand weight per assigned point |
 
 ### Figure (`clusters_before_after.png`)
 
